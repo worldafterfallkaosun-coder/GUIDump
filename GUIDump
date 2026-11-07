@@ -1,315 +1,481 @@
 --[[
-    GUI + UI Script Dumper -> .rbxm
-    Target : Delta (Roblox executor)
-    Butuh  : saveinstance, decompile, getconnections, writefile
-    Output : <workspace>/GuiDump.rbxm + GuiDump/scripts/*.lua + GuiDump/report.txt
+    GUI Dumper v2 -> .rbxm   (Delta)
+    Dump : semua GUI (PlayerGui, StarterGui, ReplicatedFirst, Billboard/SurfaceGui, nil)
+           + semua script yang menjalankan UI itu (decompile), jadi satu file
+    Output (folder workspace Delta):
+        GuiDump.rbxm  (+ salinan GuiDump.rbxmx), report.txt, scripts/*.lua, images/* (opsional)
 ]]
 
 local CFG = {
     OutName          = "GuiDump",
-    IncludeCoreGui   = false, -- true = ikut dump CoreGui (berat)
-    IncludeNil       = true,  -- GUI & script yang parent-nya nil
-    ScanReferences   = true,  -- cari script yang nyebut nama GUI di source-nya
-    SaveLooseLua     = true,  -- backup tiap script jadi .lua
-    DisableInDump    = true,  -- LocalScript di hasil dump dimatiin biar aman dibuka di Studio
+    IncludeCoreGui   = false, -- true = CoreGui ikut di-dump (berat)
+    IncludeNil       = true,
+    ScanReferences   = true,  -- cari script lain yang nyebut nama GUI di source-nya
+    DownloadImages   = false, -- true = file gambar ikut diunduh ke GuiDump/images (bisa diubah dari UI)
+    MaxImages        = 300,
+    DisableScripts   = true,  -- LocalScript di dalam dump dimatiin biar aman dibuka di Studio
+    SaveLooseLua     = true,
     DecompileTimeout = 15,
 }
 
 local env = (getgenv and getgenv()) or _G
 local function has(n) return type(env[n]) == "function" end
-local function log(...) print("[GuiDump]", ...) end
 
-local Players  = game:GetService("Players")
-local CoreGui  = game:GetService("CoreGui")
-local lp       = Players.LocalPlayer
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local UIS     = game:GetService("UserInputService")
+local lp      = Players.LocalPlayer
 
-for _, n in ipairs({"saveinstance", "decompile", "getconnections", "writefile"}) do
-    if not has(n) then warn("[GuiDump] fungsi '" .. n .. "' tidak ada di executor ini") end
+---------------------------------------------------------------- UI
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
 end
 
----------------------------------------------------------------- decompile
-local srcCache = {}
-local function getSource(s)
-    if srcCache[s] ~= nil then return srcCache[s] end
-    local src
-    if has("decompile") then
-        local done, res = false, nil
-        task.spawn(function()
-            local ok, r = pcall(decompile, s)
-            res = ok and r or ("-- decompile gagal: " .. tostring(r))
-            done = true
-        end)
-        local t = os.clock()
-        while not done and os.clock() - t < CFG.DecompileTimeout do task.wait() end
-        src = done and res or "-- decompile timeout"
-    else
-        src = "-- decompile tidak tersedia"
+local okHost, host = pcall(function() return has("gethui") and gethui() or CoreGui end)
+local gui = new("ScreenGui", {Name = "GuiDumperUI", ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true})
+if not (okHost and pcall(function() gui.Parent = host end)) then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+local W = Color3.new(1, 1, 1)
+local main = new("Frame", {Size = UDim2.fromOffset(300, 196), Position = UDim2.new(0.5, -150, 0, 60),
+    BackgroundColor3 = Color3.fromRGB(24, 24, 30), BorderSizePixel = 0, Active = true}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, main)
+
+local title = new("TextLabel", {Size = UDim2.new(1, -50, 0, 34), Position = UDim2.fromOffset(12, 0),
+    BackgroundTransparency = 1, Text = "GUI Dumper", Font = Enum.Font.GothamBold, TextSize = 16,
+    TextColor3 = W, TextXAlignment = Enum.TextXAlignment.Left}, main)
+local closeBtn = new("TextButton", {Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -34, 0, 3),
+    BackgroundColor3 = Color3.fromRGB(60, 60, 70), Text = "X", Font = Enum.Font.GothamBold,
+    TextSize = 14, TextColor3 = W}, main)
+new("UICorner", {CornerRadius = UDim.new(0, 6)}, closeBtn)
+
+local status = new("TextLabel", {Size = UDim2.new(1, -24, 0, 40), Position = UDim2.fromOffset(12, 40),
+    BackgroundTransparency = 1, Text = "Siap. Tekan Mulai Dump.", Font = Enum.Font.Gotham, TextSize = 13,
+    TextColor3 = Color3.fromRGB(200, 200, 210), TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top}, main)
+
+local bar = new("Frame", {Size = UDim2.new(1, -24, 0, 20), Position = UDim2.fromOffset(12, 88),
+    BackgroundColor3 = Color3.fromRGB(45, 45, 55), BorderSizePixel = 0}, main)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, bar)
+local fill = new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = Color3.fromRGB(88, 140, 255),
+    BorderSizePixel = 0}, bar)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, fill)
+local pctLbl = new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "0%",
+    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = W, ZIndex = 2}, bar)
+
+local startBtn = new("TextButton", {Size = UDim2.new(0.5, -18, 0, 34), Position = UDim2.fromOffset(12, 120),
+    BackgroundColor3 = Color3.fromRGB(88, 140, 255), Text = "Mulai Dump", Font = Enum.Font.GothamBold,
+    TextSize = 13, TextColor3 = W}, main)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, startBtn)
+local imgBtn = new("TextButton", {Size = UDim2.new(0.5, -18, 0, 34), Position = UDim2.new(0.5, 6, 0, 120),
+    BackgroundColor3 = Color3.fromRGB(60, 60, 70), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = W}, main)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, imgBtn)
+new("TextLabel", {Size = UDim2.new(1, -24, 0, 30), Position = UDim2.fromOffset(12, 162), BackgroundTransparency = 1,
+    Text = "Output: workspace/" .. CFG.OutName .. ".rbxm", Font = Enum.Font.Gotham, TextSize = 11,
+    TextColor3 = Color3.fromRGB(140, 140, 155), TextXAlignment = Enum.TextXAlignment.Left}, main)
+
+local function refreshImgBtn() imgBtn.Text = "Unduh gambar: " .. (CFG.DownloadImages and "ON" or "OFF") end
+refreshImgBtn()
+imgBtn.Activated:Connect(function() CFG.DownloadImages = not CFG.DownloadImages; refreshImgBtn() end)
+closeBtn.Activated:Connect(function() gui:Destroy() end)
+
+-- drag
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, i.Position, main.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
     end
-    srcCache[s] = src
-    return src
-end
-
----------------------------------------------------------------- 1. cari GUI root
-local rootEntries, seenRoot = {}, {}
-local function addRoot(inst, where)
-    if seenRoot[inst] then return end
-    seenRoot[inst] = true
-    table.insert(rootEntries, {inst = inst, where = where})
-end
-
-local function scanChildren(parent, where)
-    for _, c in ipairs(parent:GetChildren()) do
-        if c:IsA("LayerCollector") then addRoot(c, where) end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
+end)
+
+local lastY = os.clock()
+local function setProgress(p, msg)
+    p = math.clamp(p, 0, 100)
+    fill.Size = UDim2.fromScale(p / 100, 1)
+    pctLbl.Text = string.format("%d%%", math.floor(p))
+    if msg then status.Text = msg end
+    if os.clock() - lastY > 0.03 then task.wait(); lastY = os.clock() end
 end
 
-scanChildren(lp:WaitForChild("PlayerGui"), "PlayerGui")
-scanChildren(game:GetService("StarterGui"), "StarterGui")
-scanChildren(game:GetService("ReplicatedFirst"), "ReplicatedFirst")
-if CFG.IncludeCoreGui then scanChildren(CoreGui, "CoreGui") end
-
-for _, d in ipairs(game:GetDescendants()) do -- Billboard/SurfaceGui, template di RS, dll
-    if d:IsA("LayerCollector") and not seenRoot[d] and not d:IsDescendantOf(CoreGui) then
-        local nested = false
-        for _, e in ipairs(rootEntries) do
-            if d:IsDescendantOf(e.inst) then nested = true break end
-        end
-        if not nested then addRoot(d, "Game") end
-    end
+---------------------------------------------------------------- daftar properti per class
+local function P(str)
+    local t = {}
+    for name, ty in str:gmatch("(%w+):(%w+)") do t[#t + 1] = {name, ty} end
+    return t
 end
 
-if CFG.IncludeNil and has("getnilinstances") then
-    local ok, list = pcall(getnilinstances)
-    if ok and type(list) == "table" then
-        for _, i in ipairs(list) do
-            if typeof(i) == "Instance" and i:IsA("LayerCollector") then addRoot(i, "Nil") end
-        end
-    end
-end
-log("GUI root ketemu:", #rootEntries)
+local GUIOBJ = P("Active:b AnchorPoint:v2 AutomaticSize:e BackgroundColor3:c3 BackgroundTransparency:f BorderColor3:c3 BorderMode:e BorderSizePixel:i ClipsDescendants:b LayoutOrder:i Position:u2 Rotation:f Selectable:b Size:u2 SizeConstraint:e Visible:b ZIndex:i")
+local TEXT   = P("Font:e FontFace:font LineHeight:f MaxVisibleGraphemes:i RichText:b Text:s TextColor3:c3 TextScaled:b TextSize:i TextStrokeColor3:c3 TextStrokeTransparency:f TextTransparency:f TextTruncate:e TextWrapped:b TextXAlignment:e TextYAlignment:e")
+local BTN    = P("AutoButtonColor:b Modal:b")
+local TBOX   = P("ClearTextOnFocus:b MultiLine:b PlaceholderColor3:c3 PlaceholderText:s ShowNativeInput:b TextEditable:b")
+local IMG    = P("Image:cont ImageColor3:c3 ImageRectOffset:v2 ImageRectSize:v2 ImageTransparency:f ResampleMode:e ScaleType:e SliceCenter:r SliceScale:f TileSize:u2")
+local IMGBTN = P("HoverImage:cont PressedImage:cont")
+local SCROLL = P("AutomaticCanvasSize:e BottomImage:cont CanvasPosition:v2 CanvasSize:u2 ElasticBehavior:e HorizontalScrollBarInset:e MidImage:cont ScrollBarImageColor3:c3 ScrollBarImageTransparency:f ScrollBarThickness:i ScrollingDirection:e ScrollingEnabled:b TopImage:cont VerticalScrollBarInset:e VerticalScrollBarPosition:e")
 
----------------------------------------------------------------- 2. cari script pemilik UI
-local owners, ownerList = {}, {}
-local function addOwner(s, reason)
-    if typeof(s) ~= "Instance" or not s:IsA("LuaSourceContainer") then return end
-    if not owners[s] then owners[s] = reason; table.insert(ownerList, s) end
-end
-
--- (a) script yang ada di dalam GUI
-for _, e in ipairs(rootEntries) do
-    for _, d in ipairs(e.inst:GetDescendants()) do
-        if d:IsA("LuaSourceContainer") then addOwner(d, "di dalam GUI") end
-    end
-end
-
--- (b) script pemilik koneksi event GUI (tombol, input, dll)
-local SIGNALS = {
-    "MouseButton1Click", "MouseButton1Down", "MouseButton1Up", "MouseButton2Click",
-    "Activated", "InputBegan", "InputEnded", "InputChanged", "MouseEnter", "MouseLeave",
-    "MouseMoved", "FocusLost", "Focused", "TouchTap", "ChildAdded", "ChildRemoved",
+local CP = {
+    Frame = {GUIOBJ}, TextLabel = {GUIOBJ, TEXT}, TextButton = {GUIOBJ, TEXT, BTN}, TextBox = {GUIOBJ, TEXT, TBOX},
+    ImageLabel = {GUIOBJ, IMG}, ImageButton = {GUIOBJ, IMG, BTN, IMGBTN}, ScrollingFrame = {GUIOBJ, SCROLL},
+    CanvasGroup = {GUIOBJ, P("GroupColor3:c3 GroupTransparency:f")},
+    ViewportFrame = {GUIOBJ, P("Ambient:c3 ImageColor3:c3 ImageTransparency:f LightColor:c3 LightDirection:v3")},
+    VideoFrame = {GUIOBJ, P("Looped:b Playing:b TimePosition:f Video:cont Volume:f")},
+    ScreenGui = {P("DisplayOrder:i Enabled:b IgnoreGuiInset:b ResetOnSpawn:b ZIndexBehavior:e")},
+    BillboardGui = {P("Active:b AlwaysOnTop:b Brightness:f ClipsDescendants:b DistanceLowerLimit:f DistanceStep:f Enabled:b ExtentsOffset:v3 ExtentsOffsetWorldSpace:v3 LightInfluence:f MaxDistance:f ResetOnSpawn:b Size:u2 SizeOffset:v2 StudsOffset:v3 StudsOffsetWorldSpace:v3 ZIndexBehavior:e")},
+    SurfaceGui = {P("Active:b AlwaysOnTop:b Brightness:f CanvasSize:v2 ClipsDescendants:b Enabled:b Face:e LightInfluence:f PixelsPerStud:f ResetOnSpawn:b SizingMode:e ZIndexBehavior:e")},
+    UICorner = {P("CornerRadius:u")},
+    UIStroke = {P("ApplyStrokeMode:e Color:c3 Enabled:b LineJoinMode:e Thickness:f Transparency:f")},
+    UIGradient = {P("Color:cs Enabled:b Offset:v2 Rotation:f Transparency:ns")},
+    UIListLayout = {P("FillDirection:e HorizontalAlignment:e Padding:u SortOrder:e VerticalAlignment:e Wraps:b HorizontalFlex:e VerticalFlex:e ItemLineAlignment:e")},
+    UIGridLayout = {P("CellPadding:u2 CellSize:u2 FillDirection:e FillDirectionMaxCells:i HorizontalAlignment:e SortOrder:e StartCorner:e VerticalAlignment:e")},
+    UIPadding = {P("PaddingBottom:u PaddingLeft:u PaddingRight:u PaddingTop:u")},
+    UIScale = {P("Scale:f")},
+    UIAspectRatioConstraint = {P("AspectRatio:f AspectType:e DominantAxis:e")},
+    UISizeConstraint = {P("MaxSize:v2 MinSize:v2")},
+    UITextSizeConstraint = {P("MaxTextSize:i MinTextSize:i")},
+    StringValue = {P("Value:s")}, BoolValue = {P("Value:b")}, IntValue = {P("Value:i")},
+    NumberValue = {P("Value:f")}, Color3Value = {P("Value:c3")},
+    Sound = {P("SoundId:cont Volume:f PlaybackSpeed:f Looped:b RollOffMaxDistance:f RollOffMinDistance:f RollOffMode:e")},
 }
 
-local function ownerOf(fn)
-    local ok, fenv = pcall(getfenv, fn)
-    if ok and type(fenv) == "table" then
-        local ok2, s = pcall(function() return fenv.script end)
-        if ok2 and typeof(s) == "Instance" then return s end
-    end
-end
+local TY = {b = "boolean", i = "number", f = "number", s = "string", cont = "string", e = "EnumItem",
+    u2 = "UDim2", u = "UDim", v2 = "Vector2", v3 = "Vector3", c3 = "Color3", r = "Rect",
+    font = "Font", cs = "ColorSequence", ns = "NumberSequence", nr = "NumberRange"}
 
-local function scanConnections(obj)
-    for _, sig in ipairs(SIGNALS) do
-        local ok, signal = pcall(function() return obj[sig] end)
-        if ok and typeof(signal) == "RBXScriptSignal" then
-            local ok2, conns = pcall(getconnections, signal)
-            if ok2 and type(conns) == "table" then
-                for _, c in ipairs(conns) do
-                    local okf, fn = pcall(function() return c.Function end)
-                    if okf and type(fn) == "function" then
-                        local s = ownerOf(fn)
-                        if s then addOwner(s, "koneksi: " .. obj:GetFullName() .. "." .. sig) end
+---------------------------------------------------------------- proses utama
+local function run()
+    local buf, refId, assetIds = {}, 0, {}
+    local owners, ownerList, srcCache = {}, {}, {}
+    local instCount, scriptCount = 0, 0
+
+    local function getSource(s)
+        if srcCache[s] ~= nil then return srcCache[s] end
+        local src
+        if has("decompile") then
+            local done, res = false, nil
+            task.spawn(function()
+                local ok, r = pcall(decompile, s)
+                res = ok and r or ("-- decompile gagal: " .. tostring(r))
+                done = true
+            end)
+            local t = os.clock()
+            while not done and os.clock() - t < CFG.DecompileTimeout do task.wait() end
+            src = done and res or "-- decompile timeout"
+        else
+            src = "-- decompile tidak tersedia di executor ini"
+        end
+        srcCache[s] = src
+        return src
+    end
+
+    local function clean(s) return (tostring(s):gsub("[\0-\8\11\12\14-\31]", "")) end
+    local function esc(s)
+        return (clean(s):gsub("[&<>\"']", {["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;", ["'"] = "&apos;"}))
+    end
+    local function cdata(s) return "<![CDATA[" .. clean(s):gsub("]]>", "]]]]><![CDATA[>") .. "]]>" end
+    local function num(n)
+        if n ~= n then return "NAN" elseif n == math.huge then return "INF" elseif n == -math.huge then return "-INF" end
+        return string.format("%.9g", n)
+    end
+
+    local function enc(n, ty, v)
+        if typeof(v) ~= TY[ty] then return nil end
+        if ty == "b" then return ('<bool name="%s">%s</bool>'):format(n, tostring(v))
+        elseif ty == "i" then return ('<int name="%s">%d</int>'):format(n, math.floor(v + 0.5))
+        elseif ty == "f" then return ('<float name="%s">%s</float>'):format(n, num(v))
+        elseif ty == "s" then return ('<string name="%s">%s</string>'):format(n, esc(v))
+        elseif ty == "cont" then
+            if v == "" then return ('<Content name="%s"><null></null></Content>'):format(n) end
+            return ('<Content name="%s"><url>%s</url></Content>'):format(n, esc(v))
+        elseif ty == "e" then return ('<token name="%s">%d</token>'):format(n, v.Value)
+        elseif ty == "u2" then
+            return ('<UDim2 name="%s"><XS>%s</XS><XO>%s</XO><YS>%s</YS><YO>%s</YO></UDim2>'):format(n,
+                num(v.X.Scale), num(v.X.Offset), num(v.Y.Scale), num(v.Y.Offset))
+        elseif ty == "u" then return ('<UDim name="%s"><S>%s</S><O>%s</O></UDim>'):format(n, num(v.Scale), num(v.Offset))
+        elseif ty == "v2" then return ('<Vector2 name="%s"><X>%s</X><Y>%s</Y></Vector2>'):format(n, num(v.X), num(v.Y))
+        elseif ty == "v3" then return ('<Vector3 name="%s"><X>%s</X><Y>%s</Y><Z>%s</Z></Vector3>'):format(n, num(v.X), num(v.Y), num(v.Z))
+        elseif ty == "c3" then return ('<Color3 name="%s"><R>%s</R><G>%s</G><B>%s</B></Color3>'):format(n, num(v.R), num(v.G), num(v.B))
+        elseif ty == "r" then
+            return ('<Rect2D name="%s"><min><X>%s</X><Y>%s</Y></min><max><X>%s</X><Y>%s</Y></max></Rect2D>'):format(n,
+                num(v.Min.X), num(v.Min.Y), num(v.Max.X), num(v.Max.Y))
+        elseif ty == "font" then
+            return ('<Font name="%s"><Family><url>%s</url></Family><Weight>%d</Weight><Style>%s</Style></Font>'):format(n,
+                esc(v.Family), v.Weight.Value, v.Style.Name)
+        elseif ty == "cs" then
+            local t = {}
+            for _, k in ipairs(v.Keypoints) do t[#t + 1] = ("%s %s %s %s 0"):format(num(k.Time), num(k.Value.R), num(k.Value.G), num(k.Value.B)) end
+            return ('<ColorSequence name="%s">%s </ColorSequence>'):format(n, table.concat(t, " "))
+        elseif ty == "ns" then
+            local t = {}
+            for _, k in ipairs(v.Keypoints) do t[#t + 1] = ("%s %s %s"):format(num(k.Time), num(k.Value), num(k.Envelope)) end
+            return ('<NumberSequence name="%s">%s </NumberSequence>'):format(n, table.concat(t, " "))
+        elseif ty == "nr" then return ('<NumberRange name="%s">%s %s </NumberRange>'):format(n, num(v.Min), num(v.Max))
+        end
+    end
+
+    local function emitProps(inst, specs)
+        for _, list in ipairs(specs) do
+            for _, p in ipairs(list) do
+                local ok, v = pcall(function() return inst[p[1]] end)
+                if ok then
+                    local x = enc(p[1], p[2], v)
+                    if x then buf[#buf + 1] = x end
+                    if p[2] == "cont" and type(v) == "string" and p[1]:find("Image") then
+                        local id = v:match("rbxassetid://(%d+)") or v:match("[?&]id=(%d+)") or v:match("^(%d+)$")
+                        if id then assetIds[id] = true end
                     end
                 end
             end
         end
     end
-end
 
-if has("getconnections") then
-    local n = 0
-    for _, e in ipairs(rootEntries) do
-        scanConnections(e.inst)
+    local function emitScript(inst)
+        if inst.ClassName ~= "ModuleScript" then
+            local dis = true
+            if not CFG.DisableScripts then pcall(function() dis = inst.Disabled end) end
+            buf[#buf + 1] = '<bool name="Disabled">' .. tostring(dis) .. '</bool>'
+            local ok, rc = pcall(function() return inst.RunContext end)
+            if ok and typeof(rc) == "EnumItem" then buf[#buf + 1] = ('<token name="RunContext">%d</token>'):format(rc.Value) end
+        end
+        local head = ("-- Path: %s\n-- Alasan dump: %s\n\n"):format(inst:GetFullName(), owners[inst] or "child dari GUI/script yang di-dump")
+        buf[#buf + 1] = '<ProtectedString name="Source">' .. cdata(head .. getSource(inst)) .. '</ProtectedString>'
+        scriptCount += 1
+    end
+
+    local done, total = 0, 1
+    local function serialize(inst)
+        refId += 1
+        buf[#buf + 1] = ('<Item class="%s" referent="RBX%d"><Properties><string name="Name">%s</string>'):format(inst.ClassName, refId, esc(inst.Name))
+        if CP[inst.ClassName] then emitProps(inst, CP[inst.ClassName]) end
+        if inst:IsA("LuaSourceContainer") then emitScript(inst) end
+        buf[#buf + 1] = "</Properties>"
+        for _, c in ipairs(inst:GetChildren()) do serialize(c) end
+        buf[#buf + 1] = "</Item>"
+        done += 1; instCount += 1
+        if done % 15 == 0 then setProgress(60 + 32 * math.min(done / total, 1), ("Menulis %d/%d: %s"):format(done, total, inst.Name)) end
+    end
+    local function openFolder(name)
+        refId += 1
+        buf[#buf + 1] = ('<Item class="Folder" referent="RBX%d"><Properties><string name="Name">%s</string></Properties>'):format(refId, esc(name))
+    end
+    local function closeFolder() buf[#buf + 1] = "</Item>" end
+
+    -------------------------------------------------- FASE 1: cari GUI (0-8%)
+    setProgress(0, "Mencari GUI...")
+    local roots, seenRoot = {}, {}
+    local function addRoot(inst, where)
+        if seenRoot[inst] or inst == gui or inst:IsDescendantOf(gui) then return end
+        seenRoot[inst] = true
+        roots[#roots + 1] = {inst = inst, where = where}
+    end
+    for _, c in ipairs(lp:WaitForChild("PlayerGui"):GetChildren()) do addRoot(c, "PlayerGui") end
+    for _, c in ipairs(game:GetService("StarterGui"):GetChildren()) do addRoot(c, "StarterGui") end
+    for _, c in ipairs(game:GetService("ReplicatedFirst"):GetChildren()) do
+        if c:IsA("LayerCollector") then addRoot(c, "ReplicatedFirst") end
+    end
+    if CFG.IncludeCoreGui then for _, c in ipairs(CoreGui:GetChildren()) do addRoot(c, "CoreGui") end end
+
+    local all = game:GetDescendants()
+    for i, d in ipairs(all) do
+        if d:IsA("LayerCollector") and not seenRoot[d] and not d:IsDescendantOf(CoreGui) then
+            local p, nested = d.Parent, false
+            while p do if seenRoot[p] then nested = true break end p = p.Parent end
+            if not nested then addRoot(d, "Game") end
+        end
+        if i % 500 == 0 then setProgress(2 + 6 * i / #all, ("Memindai game (%d/%d)"):format(i, #all)) end
+    end
+    if CFG.IncludeNil and has("getnilinstances") then
+        local ok, list = pcall(getnilinstances)
+        if ok and type(list) == "table" then
+            for _, i in ipairs(list) do
+                if typeof(i) == "Instance" and i:IsA("LayerCollector") then addRoot(i, "Nil") end
+            end
+        end
+    end
+
+    -------------------------------------------------- FASE 2: script pemilik UI (8-35%)
+    local function addOwner(s, why)
+        if typeof(s) ~= "Instance" or not s:IsA("LuaSourceContainer") or owners[s] then return end
+        owners[s] = why; ownerList[#ownerList + 1] = s
+    end
+    local guiObjs = {}
+    for _, e in ipairs(roots) do
+        if e.inst:IsA("LuaSourceContainer") then addOwner(e.inst, "root GUI") end
+        if e.inst:IsA("GuiBase2d") or e.inst:IsA("LayerCollector") then guiObjs[#guiObjs + 1] = e.inst end
         for _, d in ipairs(e.inst:GetDescendants()) do
-            if d:IsA("GuiObject") then
-                scanConnections(d)
-                n += 1
-                if n % 200 == 0 then task.wait() end
+            if d:IsA("LuaSourceContainer") then addOwner(d, "di dalam GUI") end
+            if d:IsA("GuiObject") then guiObjs[#guiObjs + 1] = d end
+        end
+    end
+
+    local SIGNALS = {"MouseButton1Click", "MouseButton1Down", "MouseButton1Up", "MouseButton2Click", "Activated",
+        "InputBegan", "InputEnded", "InputChanged", "MouseEnter", "MouseLeave", "MouseMoved", "FocusLost",
+        "Focused", "TouchTap", "ChildAdded", "ChildRemoved"}
+    local function ownerOf(fn)
+        local ok, fenv = pcall(getfenv, fn)
+        if ok and type(fenv) == "table" then
+            local ok2, s = pcall(function() return fenv.script end)
+            if ok2 and typeof(s) == "Instance" then return s end
+        end
+    end
+    if has("getconnections") then
+        for i, obj in ipairs(guiObjs) do
+            for _, sig in ipairs(SIGNALS) do
+                local ok, signal = pcall(function() return obj[sig] end)
+                if ok and typeof(signal) == "RBXScriptSignal" then
+                    local ok2, conns = pcall(getconnections, signal)
+                    if ok2 and type(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            local okf, fn = pcall(function() return c.Function end)
+                            if okf and type(fn) == "function" then
+                                local s = ownerOf(fn)
+                                if s then addOwner(s, "koneksi: " .. obj:GetFullName() .. "." .. sig) end
+                            end
+                        end
+                    end
+                end
+            end
+            if i % 40 == 0 then setProgress(8 + 27 * i / #guiObjs, ("Cek koneksi UI (%d/%d)"):format(i, #guiObjs)) end
+        end
+    end
+
+    -------------------------------------------------- FASE 3: heuristik referensi (35-60%)
+    if CFG.ScanReferences then
+        local GENERIC = {ScreenGui = 1, Frame = 1, Main = 1, Gui = 1, UI = 1, Folder = 1, Menu = 1, Holder = 1}
+        local names = {}
+        for _, e in ipairs(roots) do
+            if #e.inst.Name >= 4 and not GENERIC[e.inst.Name] then names[e.inst.Name] = true end
+        end
+        local cand, seen = {}, {}
+        local function add(s)
+            if typeof(s) == "Instance" and not seen[s] and not owners[s]
+                and (s:IsA("LocalScript") or s:IsA("ModuleScript") or s:IsA("Script")) then
+                if not CFG.IncludeCoreGui and s:IsDescendantOf(CoreGui) then return end
+                seen[s] = true; cand[#cand + 1] = s
             end
         end
-    end
-end
-
--- (c) heuristik: script/module lain yang nyebut nama GUI di source-nya
-if CFG.ScanReferences then
-    local GENERIC = {ScreenGui=true, Frame=true, Main=true, Gui=true, UI=true, Folder=true, Menu=true, Holder=true}
-    local names = {}
-    for _, e in ipairs(rootEntries) do
-        local n = e.inst.Name
-        if #n >= 4 and not GENERIC[n] then names[n] = true end
-    end
-
-    local cand, seen = {}, {}
-    local function add(s)
-        if typeof(s) == "Instance" and not seen[s] and not owners[s]
-            and (s:IsA("LocalScript") or s:IsA("ModuleScript") or s:IsA("Script")) then
-            if not CFG.IncludeCoreGui and s:IsDescendantOf(CoreGui) then return end
-            seen[s] = true; table.insert(cand, s)
-        end
-    end
-    for _, fnName in ipairs({"getscripts", "getloadedmodules", "getnilinstances"}) do
-        if has(fnName) then
-            local ok, r = pcall(env[fnName])
-            if ok and type(r) == "table" then for _, s in ipairs(r) do add(s) end end
-        end
-    end
-    for _, d in ipairs(game:GetDescendants()) do add(d) end
-
-    log("scan referensi:", #cand, "script")
-    for i, s in ipairs(cand) do
-        local src = getSource(s)
-        for name in pairs(names) do
-            if string.find(src, name, 1, true) then
-                addOwner(s, "menyebut '" .. name .. "'")
-                break
+        for _, fnName in ipairs({"getscripts", "getloadedmodules", "getnilinstances"}) do
+            if has(fnName) then
+                local ok, r = pcall(env[fnName])
+                if ok and type(r) == "table" then for _, s in ipairs(r) do add(s) end end
             end
         end
-        if i % 25 == 0 then task.wait() end
-    end
-end
-log("script pemilik UI:", #ownerList)
-
----------------------------------------------------------------- 3. rakit container
-local out = Instance.new("Folder")
-out.Name = CFG.OutName
-local guisF = Instance.new("Folder"); guisF.Name = "Guis"; guisF.Parent = out
-local scrF  = Instance.new("Folder"); scrF.Name  = "UiScripts"; scrF.Parent = out
-
-local function cloneSafe(inst)
-    local changed = {}
-    for _, d in ipairs({inst, table.unpack(inst:GetDescendants())}) do
-        if not d.Archivable then
-            changed[#changed + 1] = d
-            pcall(function() d.Archivable = true end)
+        for _, d in ipairs(all) do add(d) end
+        for i, s in ipairs(cand) do
+            local src = getSource(s)
+            for name in pairs(names) do
+                if string.find(src, name, 1, true) then addOwner(s, "menyebut '" .. name .. "'") break end
+            end
+            if i % 5 == 0 then setProgress(35 + 25 * i / #cand, ("Scan script (%d/%d)"):format(i, #cand)) end
         end
     end
-    local ok, c = pcall(function() return inst:Clone() end)
-    for _, d in ipairs(changed) do pcall(function() d.Archivable = false end) end
-    return ok and c or nil
-end
+    setProgress(60, ("GUI: %d | script UI: %d. Mulai menulis..."):format(#roots, #ownerList))
 
-local cloneMap = {} -- clone script -> script asli
-local function mirror(orig, clone)
-    if orig:IsA("LuaSourceContainer") then cloneMap[clone] = orig end
-    local oc, cc = orig:GetChildren(), clone:GetChildren()
-    for i = 1, math.min(#oc, #cc) do
-        if oc[i].Name == cc[i].Name and oc[i].ClassName == cc[i].ClassName then
-            mirror(oc[i], cc[i])
+    -------------------------------------------------- FASE 4: tulis rbxm (60-92%)
+    local outside = {}
+    for _, s in ipairs(ownerList) do
+        local p, inside = s.Parent, false
+        if seenRoot[s] then inside = true end
+        while p and not inside do if seenRoot[p] then inside = true end p = p.Parent end
+        if not inside then outside[#outside + 1] = s end
+    end
+    total = 0
+    for _, e in ipairs(roots) do total += 1 + #e.inst:GetDescendants() end
+    for _, s in ipairs(outside) do total += 1 + #s:GetDescendants() end
+
+    openFolder(CFG.OutName)
+    openFolder("Guis")
+    for _, where in ipairs({"PlayerGui", "StarterGui", "ReplicatedFirst", "Game", "Nil", "CoreGui"}) do
+        local first = true
+        for _, e in ipairs(roots) do
+            if e.where == where then
+                if first then openFolder(where); first = false end
+                serialize(e.inst)
+            end
         end
+        if not first then closeFolder() end
     end
-end
+    closeFolder()
+    openFolder("UiScripts")
+    for _, s in ipairs(outside) do serialize(s) end
+    closeFolder()
+    closeFolder()
 
-local whereFolders = {}
-for _, e in ipairs(rootEntries) do
-    local f = whereFolders[e.where]
-    if not f then
-        f = Instance.new("Folder"); f.Name = e.where; f.Parent = guisF
-        whereFolders[e.where] = f
-    end
-    local c = cloneSafe(e.inst)
-    if c then mirror(e.inst, c); c.Parent = f end
-end
+    local xml = '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">\n'
+        .. '<Meta name="ExplicitAutoJoints">true</Meta>\n<External>null</External>\n<External>nil</External>\n'
+        .. table.concat(buf) .. '\n</roblox>'
 
-for _, s in ipairs(ownerList) do
-    local insideRoot = false
-    for _, e in ipairs(rootEntries) do
-        if s:IsDescendantOf(e.inst) then insideRoot = true break end
-    end
-    if not insideRoot then
-        local c = cloneSafe(s)
-        if c then mirror(s, c); c.Parent = scrF end
-    end
-end
-
-local function injectSource(c, src)
-    if pcall(function() c.Source = src end) then return true end
-    if has("sethiddenproperty") and pcall(sethiddenproperty, c, "Source", src) then return true end
-    if has("setscriptable") then
-        pcall(setscriptable, c, "Source", true)
-        if pcall(function() c.Source = src end) then return true end
-    end
-    return false
-end
-
-local injected, failed = 0, 0
-for c, orig in pairs(cloneMap) do
-    if injectSource(c, getSource(orig)) then injected += 1 else failed += 1 end
-    if CFG.DisableInDump and c:IsA("LocalScript") then pcall(function() c.Disabled = true end) end
-end
-log(("source ke-inject: %d | gagal: %d (yang gagal diandalkan ke decompiler saveinstance)"):format(injected, failed))
-
----------------------------------------------------------------- 4. backup .lua + report
-local function sanitize(s) return (tostring(s):gsub("[^%w_%-]", "_")) end
-
-if has("writefile") then
+    -------------------------------------------------- FASE 5: simpan (92-100%)
+    setProgress(92, "Menyimpan file...")
+    if not has("writefile") then error("writefile tidak tersedia di executor ini") end
     if has("makefolder") and has("isfolder") then
-        if not isfolder(CFG.OutName) then makefolder(CFG.OutName) end
-        if not isfolder(CFG.OutName .. "/scripts") then makefolder(CFG.OutName .. "/scripts") end
+        for _, f in ipairs({CFG.OutName, CFG.OutName .. "/scripts", CFG.OutName .. "/images"}) do
+            if not isfolder(f) then pcall(makefolder, f) end
+        end
     end
+    writefile(CFG.OutName .. ".rbxm", xml)
+    pcall(writefile, CFG.OutName .. ".rbxmx", xml)
 
     local report = {"== GUI ROOT =="}
-    for _, e in ipairs(rootEntries) do
-        report[#report + 1] = ("[%s] %s (%s)"):format(e.where, e.inst:GetFullName(), e.inst.ClassName)
-    end
+    for _, e in ipairs(roots) do report[#report + 1] = ("[%s] %s (%s)"):format(e.where, e.inst:GetFullName(), e.inst.ClassName) end
     report[#report + 1] = "\n== SCRIPT PEMILIK UI =="
-
     for i, s in ipairs(ownerList) do
-        local fname = ("%s/scripts/%03d_%s_%s.lua"):format(CFG.OutName, i, s.ClassName, sanitize(s.Name))
         report[#report + 1] = ("%03d | %s | %s | %s"):format(i, s.ClassName, s:GetFullName(), owners[s])
         if CFG.SaveLooseLua then
-            local header = ("-- %s\n-- %s | %s\n\n"):format(s:GetFullName(), s.ClassName, owners[s])
-            pcall(writefile, fname, header .. getSource(s))
+            local fname = ("%s/scripts/%03d_%s_%s.lua"):format(CFG.OutName, i, s.ClassName, (s.Name:gsub("[^%w_%-]", "_")))
+            pcall(writefile, fname, ("-- %s\n-- %s\n\n%s"):format(s:GetFullName(), owners[s], getSource(s)))
         end
     end
+    local ids = {}
+    for id in pairs(assetIds) do ids[#ids + 1] = id end
+    table.sort(ids)
+    report[#report + 1] = "\n== ASSET GAMBAR (" .. #ids .. ") =="
+    for _, id in ipairs(ids) do report[#report + 1] = "rbxassetid://" .. id end
     pcall(writefile, CFG.OutName .. "/report.txt", table.concat(report, "\n"))
-end
 
----------------------------------------------------------------- 5. save .rbxm
-local function saved()
-    if not has("isfile") then return nil end
-    for _, ext in ipairs({".rbxm", ".rbxmx", ".rbxl"}) do
-        if isfile(CFG.OutName .. ext) then return CFG.OutName .. ext end
+    -- unduh file gambar (opsional)
+    local got = 0
+    if CFG.DownloadImages and #ids > 0 then
+        local req = (env.syn and env.syn.request) or (env.http and env.http.request) or env.http_request or env.request
+        if req then
+            local n = math.min(#ids, CFG.MaxImages)
+            for i = 1, n do
+                local id = ids[i]
+                for _ = 1, 2 do
+                    local ok, res = pcall(req, {Url = "https://assetdelivery.roblox.com/v1/asset/?id=" .. id, Method = "GET"})
+                    if not (ok and res and res.StatusCode == 200 and res.Body and #res.Body > 0) then break end
+                    local body = res.Body
+                    if body:sub(1, 7) == "<roblox" then -- decal -> ambil id gambarnya
+                        id = body:match("rbxassetid://(%d+)") or body:match("[?&]id=(%d+)")
+                        if not id then break end
+                    else
+                        local ext = (body:sub(2, 4) == "PNG") and "png" or (body:sub(1, 2) == "\255\216") and "jpg" or "bin"
+                        pcall(writefile, ("%s/images/%s.%s"):format(CFG.OutName, ids[i], ext), body)
+                        got += 1
+                        break
+                    end
+                end
+                setProgress(94 + 5 * i / n, ("Unduh gambar (%d/%d)"):format(i, n))
+                task.wait(0.05)
+            end
+        else
+            warn("[GuiDump] executor tidak punya request/http_request, gambar tidak diunduh")
+        end
     end
+
+    setProgress(100, ("Selesai! %d instance | %d script | %d gambar (%d diunduh)\n-> %s.rbxm"):format(instCount, scriptCount, #ids, got, CFG.OutName))
 end
 
-local attempts = {
-    function()
-        saveinstance({Object = out, FilePath = CFG.OutName, IsModel = true, Binary = true,
-                      noscripts = false, mode = "full", ShowStatus = false})
-    end,
-    function() saveinstance(out, CFG.OutName, {IsModel = true, Binary = true, noscripts = false}) end,
-    function() saveinstance({ExtraInstances = {out}, FilePath = CFG.OutName, IsModel = true, Binary = true}) end,
-}
-
-if has("saveinstance") then
-    for i, attempt in ipairs(attempts) do
-        local ok, err = pcall(attempt)
-        local f = saved()
-        if f then log("BERHASIL ->", f, "(metode " .. i .. ")") break end
-        warn("[GuiDump] metode " .. i .. " gagal:", ok and "file tidak muncul" or tostring(err))
-    end
-else
-    warn("[GuiDump] saveinstance tidak ada -> cuma backup .lua + report.txt yang dibuat")
-end
-
-pcall(function() out:Destroy() end)
-log("selesai. cek folder workspace Delta.")
+startBtn.Activated:Connect(function()
+    if startBtn.Text ~= "Mulai Dump" then return end
+    startBtn.Text = "Berjalan..."
+    local ok, err = pcall(run)
+    if not ok then status.Text = "Error: " .. tostring(err); warn("[GuiDump]", err) end
+    startBtn.Text = "Mulai Dump"
+end)
