@@ -1,0 +1,315 @@
+--[[
+    GUI + UI Script Dumper -> .rbxm
+    Target : Delta (Roblox executor)
+    Butuh  : saveinstance, decompile, getconnections, writefile
+    Output : <workspace>/GuiDump.rbxm + GuiDump/scripts/*.lua + GuiDump/report.txt
+]]
+
+local CFG = {
+    OutName          = "GuiDump",
+    IncludeCoreGui   = false, -- true = ikut dump CoreGui (berat)
+    IncludeNil       = true,  -- GUI & script yang parent-nya nil
+    ScanReferences   = true,  -- cari script yang nyebut nama GUI di source-nya
+    SaveLooseLua     = true,  -- backup tiap script jadi .lua
+    DisableInDump    = true,  -- LocalScript di hasil dump dimatiin biar aman dibuka di Studio
+    DecompileTimeout = 15,
+}
+
+local env = (getgenv and getgenv()) or _G
+local function has(n) return type(env[n]) == "function" end
+local function log(...) print("[GuiDump]", ...) end
+
+local Players  = game:GetService("Players")
+local CoreGui  = game:GetService("CoreGui")
+local lp       = Players.LocalPlayer
+
+for _, n in ipairs({"saveinstance", "decompile", "getconnections", "writefile"}) do
+    if not has(n) then warn("[GuiDump] fungsi '" .. n .. "' tidak ada di executor ini") end
+end
+
+---------------------------------------------------------------- decompile
+local srcCache = {}
+local function getSource(s)
+    if srcCache[s] ~= nil then return srcCache[s] end
+    local src
+    if has("decompile") then
+        local done, res = false, nil
+        task.spawn(function()
+            local ok, r = pcall(decompile, s)
+            res = ok and r or ("-- decompile gagal: " .. tostring(r))
+            done = true
+        end)
+        local t = os.clock()
+        while not done and os.clock() - t < CFG.DecompileTimeout do task.wait() end
+        src = done and res or "-- decompile timeout"
+    else
+        src = "-- decompile tidak tersedia"
+    end
+    srcCache[s] = src
+    return src
+end
+
+---------------------------------------------------------------- 1. cari GUI root
+local rootEntries, seenRoot = {}, {}
+local function addRoot(inst, where)
+    if seenRoot[inst] then return end
+    seenRoot[inst] = true
+    table.insert(rootEntries, {inst = inst, where = where})
+end
+
+local function scanChildren(parent, where)
+    for _, c in ipairs(parent:GetChildren()) do
+        if c:IsA("LayerCollector") then addRoot(c, where) end
+    end
+end
+
+scanChildren(lp:WaitForChild("PlayerGui"), "PlayerGui")
+scanChildren(game:GetService("StarterGui"), "StarterGui")
+scanChildren(game:GetService("ReplicatedFirst"), "ReplicatedFirst")
+if CFG.IncludeCoreGui then scanChildren(CoreGui, "CoreGui") end
+
+for _, d in ipairs(game:GetDescendants()) do -- Billboard/SurfaceGui, template di RS, dll
+    if d:IsA("LayerCollector") and not seenRoot[d] and not d:IsDescendantOf(CoreGui) then
+        local nested = false
+        for _, e in ipairs(rootEntries) do
+            if d:IsDescendantOf(e.inst) then nested = true break end
+        end
+        if not nested then addRoot(d, "Game") end
+    end
+end
+
+if CFG.IncludeNil and has("getnilinstances") then
+    local ok, list = pcall(getnilinstances)
+    if ok and type(list) == "table" then
+        for _, i in ipairs(list) do
+            if typeof(i) == "Instance" and i:IsA("LayerCollector") then addRoot(i, "Nil") end
+        end
+    end
+end
+log("GUI root ketemu:", #rootEntries)
+
+---------------------------------------------------------------- 2. cari script pemilik UI
+local owners, ownerList = {}, {}
+local function addOwner(s, reason)
+    if typeof(s) ~= "Instance" or not s:IsA("LuaSourceContainer") then return end
+    if not owners[s] then owners[s] = reason; table.insert(ownerList, s) end
+end
+
+-- (a) script yang ada di dalam GUI
+for _, e in ipairs(rootEntries) do
+    for _, d in ipairs(e.inst:GetDescendants()) do
+        if d:IsA("LuaSourceContainer") then addOwner(d, "di dalam GUI") end
+    end
+end
+
+-- (b) script pemilik koneksi event GUI (tombol, input, dll)
+local SIGNALS = {
+    "MouseButton1Click", "MouseButton1Down", "MouseButton1Up", "MouseButton2Click",
+    "Activated", "InputBegan", "InputEnded", "InputChanged", "MouseEnter", "MouseLeave",
+    "MouseMoved", "FocusLost", "Focused", "TouchTap", "ChildAdded", "ChildRemoved",
+}
+
+local function ownerOf(fn)
+    local ok, fenv = pcall(getfenv, fn)
+    if ok and type(fenv) == "table" then
+        local ok2, s = pcall(function() return fenv.script end)
+        if ok2 and typeof(s) == "Instance" then return s end
+    end
+end
+
+local function scanConnections(obj)
+    for _, sig in ipairs(SIGNALS) do
+        local ok, signal = pcall(function() return obj[sig] end)
+        if ok and typeof(signal) == "RBXScriptSignal" then
+            local ok2, conns = pcall(getconnections, signal)
+            if ok2 and type(conns) == "table" then
+                for _, c in ipairs(conns) do
+                    local okf, fn = pcall(function() return c.Function end)
+                    if okf and type(fn) == "function" then
+                        local s = ownerOf(fn)
+                        if s then addOwner(s, "koneksi: " .. obj:GetFullName() .. "." .. sig) end
+                    end
+                end
+            end
+        end
+    end
+end
+
+if has("getconnections") then
+    local n = 0
+    for _, e in ipairs(rootEntries) do
+        scanConnections(e.inst)
+        for _, d in ipairs(e.inst:GetDescendants()) do
+            if d:IsA("GuiObject") then
+                scanConnections(d)
+                n += 1
+                if n % 200 == 0 then task.wait() end
+            end
+        end
+    end
+end
+
+-- (c) heuristik: script/module lain yang nyebut nama GUI di source-nya
+if CFG.ScanReferences then
+    local GENERIC = {ScreenGui=true, Frame=true, Main=true, Gui=true, UI=true, Folder=true, Menu=true, Holder=true}
+    local names = {}
+    for _, e in ipairs(rootEntries) do
+        local n = e.inst.Name
+        if #n >= 4 and not GENERIC[n] then names[n] = true end
+    end
+
+    local cand, seen = {}, {}
+    local function add(s)
+        if typeof(s) == "Instance" and not seen[s] and not owners[s]
+            and (s:IsA("LocalScript") or s:IsA("ModuleScript") or s:IsA("Script")) then
+            if not CFG.IncludeCoreGui and s:IsDescendantOf(CoreGui) then return end
+            seen[s] = true; table.insert(cand, s)
+        end
+    end
+    for _, fnName in ipairs({"getscripts", "getloadedmodules", "getnilinstances"}) do
+        if has(fnName) then
+            local ok, r = pcall(env[fnName])
+            if ok and type(r) == "table" then for _, s in ipairs(r) do add(s) end end
+        end
+    end
+    for _, d in ipairs(game:GetDescendants()) do add(d) end
+
+    log("scan referensi:", #cand, "script")
+    for i, s in ipairs(cand) do
+        local src = getSource(s)
+        for name in pairs(names) do
+            if string.find(src, name, 1, true) then
+                addOwner(s, "menyebut '" .. name .. "'")
+                break
+            end
+        end
+        if i % 25 == 0 then task.wait() end
+    end
+end
+log("script pemilik UI:", #ownerList)
+
+---------------------------------------------------------------- 3. rakit container
+local out = Instance.new("Folder")
+out.Name = CFG.OutName
+local guisF = Instance.new("Folder"); guisF.Name = "Guis"; guisF.Parent = out
+local scrF  = Instance.new("Folder"); scrF.Name  = "UiScripts"; scrF.Parent = out
+
+local function cloneSafe(inst)
+    local changed = {}
+    for _, d in ipairs({inst, table.unpack(inst:GetDescendants())}) do
+        if not d.Archivable then
+            changed[#changed + 1] = d
+            pcall(function() d.Archivable = true end)
+        end
+    end
+    local ok, c = pcall(function() return inst:Clone() end)
+    for _, d in ipairs(changed) do pcall(function() d.Archivable = false end) end
+    return ok and c or nil
+end
+
+local cloneMap = {} -- clone script -> script asli
+local function mirror(orig, clone)
+    if orig:IsA("LuaSourceContainer") then cloneMap[clone] = orig end
+    local oc, cc = orig:GetChildren(), clone:GetChildren()
+    for i = 1, math.min(#oc, #cc) do
+        if oc[i].Name == cc[i].Name and oc[i].ClassName == cc[i].ClassName then
+            mirror(oc[i], cc[i])
+        end
+    end
+end
+
+local whereFolders = {}
+for _, e in ipairs(rootEntries) do
+    local f = whereFolders[e.where]
+    if not f then
+        f = Instance.new("Folder"); f.Name = e.where; f.Parent = guisF
+        whereFolders[e.where] = f
+    end
+    local c = cloneSafe(e.inst)
+    if c then mirror(e.inst, c); c.Parent = f end
+end
+
+for _, s in ipairs(ownerList) do
+    local insideRoot = false
+    for _, e in ipairs(rootEntries) do
+        if s:IsDescendantOf(e.inst) then insideRoot = true break end
+    end
+    if not insideRoot then
+        local c = cloneSafe(s)
+        if c then mirror(s, c); c.Parent = scrF end
+    end
+end
+
+local function injectSource(c, src)
+    if pcall(function() c.Source = src end) then return true end
+    if has("sethiddenproperty") and pcall(sethiddenproperty, c, "Source", src) then return true end
+    if has("setscriptable") then
+        pcall(setscriptable, c, "Source", true)
+        if pcall(function() c.Source = src end) then return true end
+    end
+    return false
+end
+
+local injected, failed = 0, 0
+for c, orig in pairs(cloneMap) do
+    if injectSource(c, getSource(orig)) then injected += 1 else failed += 1 end
+    if CFG.DisableInDump and c:IsA("LocalScript") then pcall(function() c.Disabled = true end) end
+end
+log(("source ke-inject: %d | gagal: %d (yang gagal diandalkan ke decompiler saveinstance)"):format(injected, failed))
+
+---------------------------------------------------------------- 4. backup .lua + report
+local function sanitize(s) return (tostring(s):gsub("[^%w_%-]", "_")) end
+
+if has("writefile") then
+    if has("makefolder") and has("isfolder") then
+        if not isfolder(CFG.OutName) then makefolder(CFG.OutName) end
+        if not isfolder(CFG.OutName .. "/scripts") then makefolder(CFG.OutName .. "/scripts") end
+    end
+
+    local report = {"== GUI ROOT =="}
+    for _, e in ipairs(rootEntries) do
+        report[#report + 1] = ("[%s] %s (%s)"):format(e.where, e.inst:GetFullName(), e.inst.ClassName)
+    end
+    report[#report + 1] = "\n== SCRIPT PEMILIK UI =="
+
+    for i, s in ipairs(ownerList) do
+        local fname = ("%s/scripts/%03d_%s_%s.lua"):format(CFG.OutName, i, s.ClassName, sanitize(s.Name))
+        report[#report + 1] = ("%03d | %s | %s | %s"):format(i, s.ClassName, s:GetFullName(), owners[s])
+        if CFG.SaveLooseLua then
+            local header = ("-- %s\n-- %s | %s\n\n"):format(s:GetFullName(), s.ClassName, owners[s])
+            pcall(writefile, fname, header .. getSource(s))
+        end
+    end
+    pcall(writefile, CFG.OutName .. "/report.txt", table.concat(report, "\n"))
+end
+
+---------------------------------------------------------------- 5. save .rbxm
+local function saved()
+    if not has("isfile") then return nil end
+    for _, ext in ipairs({".rbxm", ".rbxmx", ".rbxl"}) do
+        if isfile(CFG.OutName .. ext) then return CFG.OutName .. ext end
+    end
+end
+
+local attempts = {
+    function()
+        saveinstance({Object = out, FilePath = CFG.OutName, IsModel = true, Binary = true,
+                      noscripts = false, mode = "full", ShowStatus = false})
+    end,
+    function() saveinstance(out, CFG.OutName, {IsModel = true, Binary = true, noscripts = false}) end,
+    function() saveinstance({ExtraInstances = {out}, FilePath = CFG.OutName, IsModel = true, Binary = true}) end,
+}
+
+if has("saveinstance") then
+    for i, attempt in ipairs(attempts) do
+        local ok, err = pcall(attempt)
+        local f = saved()
+        if f then log("BERHASIL ->", f, "(metode " .. i .. ")") break end
+        warn("[GuiDump] metode " .. i .. " gagal:", ok and "file tidak muncul" or tostring(err))
+    end
+else
+    warn("[GuiDump] saveinstance tidak ada -> cuma backup .lua + report.txt yang dibuat")
+end
+
+pcall(function() out:Destroy() end)
+log("selesai. cek folder workspace Delta.")
